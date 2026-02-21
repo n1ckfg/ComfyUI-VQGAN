@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-vqgan"
+description = "Use VQGAN+CLip"
+version = "0.0.1"
+license = { file = "LICENSE" }
+dependencies = ["omegaconf", "ftfy"]
+
+[project.urls]
+Repository = "https://github.com/n1ckfg/ComfyUI-VQGAN"
+
+#  Used by Comfy Registry https://comfyregistry.org
+[tool.comfy]
+PublisherId = "n1ckfg"
+DisplayName = "ComfyUI-VQGAN"
+Icon = ""
