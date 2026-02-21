@@ -10,6 +10,7 @@ from omegaconf import OmegaConf
 
 # VQGAN-CLIP core imports
 import sys
+import types
 # Make sure the local folders for taming-transformers and CLIP are in the path
 # Since we are in the root of the custom node, it's just sys.path.append('.')
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -17,10 +18,83 @@ sys.path.append(current_dir)
 sys.path.append(os.path.join(current_dir, 'taming-transformers'))
 sys.path.append(os.path.join(current_dir, 'CLIP'))
 
+# ---------------------------------------------------------------------------
+# Minimal pytorch_lightning shim — taming-transformers uses LightningModule as
+# a base class, but only torch.nn.Module functionality is needed for inference.
+# We also stub the submodules that taming's main.py imports at the top level.
+# ---------------------------------------------------------------------------
+if 'pytorch_lightning' not in sys.modules:
+    import importlib
+
+    def _make_stub(name):
+        m = types.ModuleType(name)
+        sys.modules[name] = m
+        return m
+
+    _pl = _make_stub('pytorch_lightning')
+
+    class _LightningModule(torch.nn.Module):
+        pass
+
+    class _TrainResult:
+        def __init__(self, *args, **kwargs): pass
+
+    class _EvalResult:
+        def __init__(self, *args, **kwargs): pass
+
+    def _seed_everything(*args, **kwargs): pass
+
+    class _Stub:
+        def __init__(self, *args, **kwargs): pass
+
+    _pl.LightningModule = _LightningModule
+    _pl.TrainResult = _TrainResult
+    _pl.EvalResult = _EvalResult
+    _pl.seed_everything = _seed_everything
+
+    # pytorch_lightning.trainer
+    _pl_trainer = _make_stub('pytorch_lightning.trainer')
+    _pl_trainer.Trainer = _Stub
+    _pl.Trainer = _Stub
+
+    # pytorch_lightning.callbacks
+    _pl_callbacks = _make_stub('pytorch_lightning.callbacks')
+    _pl_callbacks.ModelCheckpoint = _Stub
+    _pl_callbacks.Callback = _Stub
+    _pl_callbacks.LearningRateMonitor = _Stub
+
+    # pytorch_lightning.utilities
+    _pl_utilities = _make_stub('pytorch_lightning.utilities')
+    _pl_utilities.rank_zero_only = lambda f: f
+
+# ---------------------------------------------------------------------------
+# Stub for taming-transformers/main.py — only instantiate_from_config is
+# needed from it; importing main.py directly would pull in the full
+# pytorch_lightning training stack.
+# ---------------------------------------------------------------------------
+if 'main' not in sys.modules:
+    import importlib as _importlib
+
+    def _get_obj_from_str(string, reload=False):
+        module, cls = string.rsplit(".", 1)
+        if reload:
+            mod = _importlib.import_module(module)
+            _importlib.reload(mod)
+        return getattr(_importlib.import_module(module, package=None), cls)
+
+    def _instantiate_from_config(config):
+        if "target" not in config:
+            raise KeyError("Expected key `target` to instantiate.")
+        return _get_obj_from_str(config["target"])(**config.get("params", dict()))
+
+    _main = types.ModuleType('main')
+    _main.get_obj_from_str = _get_obj_from_str
+    _main.instantiate_from_config = _instantiate_from_config
+    sys.modules['main'] = _main
+
 from taming.models import cond_transformer, vqgan
 from CLIP import clip
 import kornia.augmentation as K
-from torch_optimizer import AdamP
 
 # Import constants and helper functions from generate.py logic
 # (Copied and adapted for a class-based structure)
@@ -195,30 +269,38 @@ class VQGANCLIP_Node:
     CATEGORY = "VQGAN-CLIP"
 
     def generate(self, text_prompt, iterations, seed, width, height, learning_rate, cutn, vqgan_model, clip_model, init_image=None):
+        # ComfyUI runs all nodes inside torch.inference_mode(), which disables
+        # the autograd graph entirely and cannot be overridden by enable_grad().
+        # We must explicitly exit inference_mode so that loss.backward() works.
+        with torch.inference_mode(mode=False):
+            with torch.enable_grad():
+                return self._generate(text_prompt, iterations, seed, width, height, learning_rate, cutn, vqgan_model, clip_model, init_image)
+
+    def _generate(self, text_prompt, iterations, seed, width, height, learning_rate, cutn, vqgan_model, clip_model, init_image=None):
         torch.manual_seed(seed)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
         # Paths for configs and checkpoints
         base_path = os.path.dirname(os.path.abspath(__file__))
         checkpoints_path = os.path.join(base_path, "checkpoints")
         os.makedirs(checkpoints_path, exist_ok=True)
-        
+
         config_path = os.path.join(checkpoints_path, f"{vqgan_model}.yaml")
         checkpoint_path = os.path.join(checkpoints_path, f"{vqgan_model}.ckpt")
-        
+
         if not os.path.exists(config_path) or not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"VQGAN config or checkpoint not found at {config_path} / {checkpoint_path}. \nPlease run the provided download_models.sh script in the custom node directory: \ncd {base_path} && bash download_models.sh")
 
         model = load_vqgan_model(config_path, checkpoint_path).to(device)
         perceptor = load_clip_model(clip_model, device)
-        
+
         cut_size = perceptor.visual.input_resolution
         f = 2**(model.decoder.num_resolutions - 1)
         make_cutouts = MakeCutouts(cut_size, cutn, cut_pow=1.0).to(device)
-        
+
         toksX, toksY = width // f, height // f
         sideX, sideY = toksX * f, toksY * f
-        
+
         # Initialize z
         gumbel = isinstance(model, vqgan.GumbelVQ)
         if gumbel:
@@ -247,13 +329,13 @@ class VQGANCLIP_Node:
                 z = one_hot @ model.quantize.embedding.weight
             z = z.view([-1, toksY, toksX, e_dim]).permute(0, 3, 1, 2)
 
-        z.requires_grad_(True)
+        z = z.detach().requires_grad_(True)
         opt = torch.optim.Adam([z], lr=learning_rate)
-        
+
         # Prompts
         normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                           std=[0.26862954, 0.26130258, 0.27577711])
-        
+
         pMs = []
         # Multi-prompt support via |
         prompts = [phrase.strip() for phrase in text_prompt.split("|")]
@@ -261,7 +343,7 @@ class VQGANCLIP_Node:
             txt, weight, stop = split_prompt(prompt)
             embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
             pMs.append(Prompt(embed, weight, stop).to(device))
-            
+
         def synth(z):
             if gumbel:
                 z_q = vector_quantize(z.movedim(1, 3), model.quantize.embed.weight).movedim(3, 1)
@@ -270,25 +352,25 @@ class VQGANCLIP_Node:
             return clamp_with_grad(model.decode(z_q).add(1).div(2), 0, 1)
 
         torch.manual_seed(seed)
-        
+
         # Training loop
         for i in tqdm(range(iterations)):
             opt.zero_grad(set_to_none=True)
-            
+
             out = synth(z)
             iii = perceptor.encode_image(normalize(make_cutouts(out))).float()
-            
+
             losses = []
             for prompt in pMs:
                 losses.append(prompt(iii))
-            
+
             loss = sum(losses)
             loss.backward()
             opt.step()
-            
+
             with torch.no_grad():
                 z.copy_(z.maximum(z_min).minimum(z_max))
-        
+
         # Final output
         with torch.no_grad():
             final_out = synth(z)
