@@ -1,6 +1,0 @@
-[submodule "taming-transformers"]
-	path = taming-transformers
-	url = https://github.com/n1ckfg/taming-transformers
-[submodule "CLIP"]
-	path = CLIP
-	url = https://github.com/n1ckfg/CLIP
