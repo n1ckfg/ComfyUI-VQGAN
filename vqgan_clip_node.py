@@ -5,8 +5,8 @@ from PIL import Image
 import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.transforms import functional as TF
-from tqdm import tqdm
 from omegaconf import OmegaConf
+import comfy.utils
 
 # VQGAN-CLIP core imports
 import sys
@@ -354,7 +354,8 @@ class VQGANCLIP_Node:
         torch.manual_seed(seed)
 
         # Training loop
-        for i in tqdm(range(iterations)):
+        pbar = comfy.utils.ProgressBar(iterations)
+        for i in range(iterations):
             opt.zero_grad(set_to_none=True)
 
             out = synth(z)
@@ -370,6 +371,8 @@ class VQGANCLIP_Node:
 
             with torch.no_grad():
                 z.copy_(z.maximum(z_min).minimum(z_max))
+
+            pbar.update(1)
 
         # Final output
         with torch.no_grad():
